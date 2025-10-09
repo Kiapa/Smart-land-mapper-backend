@@ -1,194 +1,238 @@
 import ee
 import math
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, Field
-from typing import List, Optional
-import google.auth
-from google.oauth2.service_account import Credentials
+from typing import List, Optional, Dict, Any
+import firebase_admin
+from firebase_admin import credentials, auth, firestore
+from fastapi.security import OAuth2PasswordBearer
+import datetime
 
-# --- GEE Initialization (No changes) ---
+# --- Firebase & GEE Initialization ---
+# This uses the same service account key for both Google services
 try:
     KEY_FILE_PATH = 'gen-lang-client-0427725945-dc7fe2faa8ab.json'
-    credentials, project_id = google.auth.load_credentials_from_file(KEY_FILE_PATH)
-    scoped_credentials = credentials.with_scopes([
-        'https://www.googleapis.com/auth/cloud-platform',
-        'https://www.googleapis.com/auth/earthengine'
-    ])
-    ee.Initialize(credentials=scoped_credentials)
-    print("Google Earth Engine initialized successfully using Service Account.")
+    cred = credentials.Certificate(KEY_FILE_PATH)
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    print("Firebase Admin SDK initialized successfully.")
+
+    # Initialize GEE using the same credentials object
+    ee.Initialize(cred)
+    print("Google Earth Engine initialized successfully.")
+
 except Exception as e:
-    print(f"Error initializing GEE: {e}")
+    print(f"Error during initialization: {e}")
     exit()
+
 
 # --- Pydantic Models ---
 class Point(BaseModel):
-    latitude: float = Field(..., ge=-90, le=90)
-    longitude: float = Field(..., ge=-180, le=180)
+    latitude: float
+    longitude: float
 
-class AnalysisRequest(BaseModel):
-    points: List[Point] = Field(..., min_items=4)
 
-class SlopeStats(BaseModel):
-    mean: float
-    min: float
-    max: float
-
-class RoadDistanceStats(BaseModel):
-    min: float
-    mean: float
-    max: float
-
-class ShapeMetrics(BaseModel):
-    area_sqm: float
-    perimeter_m: float
-    regularity_score: float
-
-# UPDATED: Add land_use_zone to the response model
 class AnalysisResult(BaseModel):
-    slope_stats: SlopeStats
+    slope_stats: Dict[str, Any]
     vegetation_cover_percent: float
-    road_distance_stats: RoadDistanceStats
+    road_distance_stats: Dict[str, Any]
     building_distance_m: float
-    shape_metrics: ShapeMetrics
+    shape_metrics: Dict[str, Any]
     suitability_score: float
-    land_use_zone: Optional[str] = "N/A" # Optional with a default value
+    land_use_zone: Optional[str] = "N/A"
 
-app = FastAPI(title="Real Parcel Analysis API (GEE)")
 
-# --- GEE Analysis Functions ---
-def analyze_slope(roi: ee.Geometry) -> dict:
+class SaveReportRequest(BaseModel):
+    parcelName: str
+    reportData: AnalysisResult
+    polygonCoords: List[Point]
+
+
+app = FastAPI(title="SmartLand Mapper API")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+
+# --- Dependency to verify Firebase ID Token ---
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    """Verifies the Firebase ID token and returns the user's data."""
+    try:
+        decoded_token = auth.verify_id_token(token)
+        return decoded_token
+    except Exception as e:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Invalid authentication credentials: {e}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+# --- Analysis Functions ---
+def analyze_slope(roi):
     dem = ee.Image("USGS/SRTMGL1_003")
     slope = ee.Terrain.slope(dem)
-    slope_roi = slope.clip(roi)
-    stats = slope_roi.reduceRegion(
-        reducer=ee.Reducer.mean().combine(reducer2=ee.Reducer.minMax(), sharedInputs=True),
-        geometry=roi, scale=30, maxPixels=1e9
-    ).getInfo()
+    stats = slope.clip(roi).reduceRegion(reducer=ee.Reducer.mean().combine(ee.Reducer.minMax(), True), geometry=roi,
+                                         scale=30, maxPixels=1e9).getInfo()
     return {'mean': stats.get('slope_mean'), 'min': stats.get('slope_min'), 'max': stats.get('slope_max')}
 
-def analyze_vegetation_cover(roi: ee.Geometry) -> float:
-    s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterBounds(roi).filterDate("2024-01-01", "2024-12-31").select(['B8', 'B4']).median()
-    ndvi = s2.normalizedDifference(['B8', 'B4']).rename('NDVI')
-    veg = ndvi.gt(0.6).rename('veg')
-    pixel_area = ee.Image.pixelArea()
-    total_area_img = pixel_area.updateMask(ee.Image.constant(1).clip(roi))
-    total_area = total_area_img.reduceRegion(reducer=ee.Reducer.sum(), geometry=roi, scale=10, maxPixels=1e13).get('area').getInfo()
-    veg_area_img = pixel_area.updateMask(veg)
-    veg_area = veg_area_img.reduceRegion(reducer=ee.Reducer.sum(), geometry=roi, scale=10, maxPixels=1e13).get('area').getInfo()
-    return 100 * veg_area / total_area if total_area is not None and total_area > 0 else 0
 
-def analyze_distance_to_roads(roi: ee.Geometry) -> dict:
+def analyze_vegetation_cover(roi):
+    s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterBounds(roi).filterDate("2024-01-01",
+                                                                                        "2024-12-31").select(
+        ['B8', 'B4']).median()
+    ndvi = s2.normalizedDifference(['B8', 'B4'])
+    # Using .gt(0.2) for general vegetation, as 0.6 is very dense
+    veg_mask = ndvi.gt(0.2)
+    pixel_area = ee.Image.pixelArea()
+    veg_area = pixel_area.updateMask(veg_mask).reduceRegion(reducer=ee.Reducer.sum(), geometry=roi, scale=10,
+                                                            maxPixels=1e13).get('area').getInfo()
+    total_area = roi.area(1).getInfo()
+    return (veg_area / total_area) * 100 if total_area and total_area > 0 else 0
+
+
+def analyze_distance_to_roads(roi):
     roads = ee.FeatureCollection("projects/sat-io/open-datasets/GRIP4/Africa")
-    distance_to_roads = roads.distance(10000)
-    dist_roi = distance_to_roads.clip(roi)
-    stats = dist_roi.reduceRegion(
-        reducer=ee.Reducer.mean().combine(reducer2=ee.Reducer.minMax(), sharedInputs=True),
-        geometry=roi, scale=30, maxPixels=1e13
-    ).getInfo()
+    stats = roads.distance(10000).clip(roi).reduceRegion(reducer=ee.Reducer.mean().combine(ee.Reducer.minMax(), True),
+                                                         geometry=roi, scale=30, maxPixels=1e13).getInfo()
     return {'min': stats.get('distance_min'), 'mean': stats.get('distance_mean'), 'max': stats.get('distance_max')}
 
-def analyze_distance_to_buildings(roi: ee.Geometry) -> float:
-    search_radius_m = 5000
-    search_area = roi.buffer(search_radius_m)
-    nearby_buildings = ee.FeatureCollection("projects/sat-io/open-datasets/MSBuildings/Kenya").filterBounds(search_area)
-    if nearby_buildings.size().getInfo() == 0:
-        return search_radius_m
-    roi_centroid = roi.centroid(1)
-    nearby_with_distance = nearby_buildings.map(lambda f: f.set('distance', roi_centroid.distance(f.geometry())))
-    nearest_building = nearby_with_distance.sort('distance').first()
-    return nearest_building.get('distance').getInfo()
 
-def analyze_shape_metrics(roi: ee.Geometry) -> dict:
+def analyze_distance_to_buildings(roi):
+    search_area = roi.buffer(5000)
+    nearby_buildings = ee.FeatureCollection("projects/sat-io/open-datasets/MSBuildings/Kenya").filterBounds(search_area)
+    if nearby_buildings.size().getInfo() == 0: return 5000
+    nearest = nearby_buildings.map(lambda f: f.set('distance', roi.centroid(1).distance(f.geometry()))).sort(
+        'distance').first()
+    return nearest.get('distance').getInfo()
+
+
+# --- UPDATED: Full shape metrics analysis ---
+def analyze_shape_metrics(roi):
     area = roi.area(1).getInfo()
     perimeter = roi.perimeter(1).getInfo()
-    pa_ratio = perimeter / area if area and area > 0 else 0
-    shape_index = (4 * math.pi * area) / (perimeter ** 2) if perimeter and perimeter > 0 else 0
+
+    if not area or not perimeter or area == 0 or perimeter == 0:
+        return {"area_sqm": 0, "perimeter_m": 0, "regularity_score": 0}
+
+    # Shape Index: Compares the shape to a circle (most compact shape)
+    shape_index = (4 * math.pi * area) / (perimeter ** 2)
+
+    # Elongation: Ratio of length to width
     bounds = roi.bounds().coordinates().getInfo()[0]
-    xs, ys = [pt[0] for pt in bounds], [pt[1] for pt in bounds]
-    length, width = (max(xs) - min(xs)) * 111000, (max(ys) - min(ys)) * 111000
+    xs = [pt[0] for pt in bounds]
+    ys = [pt[1] for pt in bounds]
+    length = (max(xs) - min(xs)) * 111000  # Approximate conversion from degrees to meters
+    width = (max(ys) - min(ys)) * 111000
     elongation = max(length, width) / min(length, width) if min(length, width) > 0 else float('inf')
+
+    # Scoring: Normalize values to a 0-1 scale
     elong_score = 1 / (1 + abs(elongation - 1)) if elongation != float('inf') else 0
-    shape_score = min(shape_index / 0.78, 1.0) if shape_index > 0 else 0
-    pa_square = 4 * math.sqrt(area) / area if area > 0 else 0
-    pa_score = min(pa_square / pa_ratio, 1.0) if pa_ratio > 0 else 0
-    regularity_score = 100 * (0.6 * elong_score + 0.2 * shape_score + 0.2 * pa_score)
+    shape_score = min(shape_index / 0.78, 1.0)  # 0.78 is a common threshold for "regular"
+
+    # Final weighted score
+    regularity_score = 100 * (0.7 * elong_score + 0.3 * shape_score)
+
     return {"area_sqm": area, "perimeter_m": perimeter, "regularity_score": regularity_score}
 
-# --- NEW: Integrated your land use analysis function ---
+
 def analyze_land_use(roi):
-    """Determines the dominant land use category of the drawn ROI using the digitized Nyeri land use layer."""
-    landuse_fc = ee.FeatureCollection("projects/gen-lang-client-0427725945/assets/nyeri_land_use")
+    landuse_fc = ee.FeatureCollection("projects/theta-messenger-442807-s5/assets/nyeri_land_use")
     intersected = landuse_fc.filterBounds(roi)
-    count = intersected.size().getInfo()
+    if intersected.size().getInfo() == 0: return "Not classified"
+    dominant = intersected.map(lambda f: f.set("iarea", f.geometry().intersection(roi, 1).area(1))).sort('iarea',
+                                                                                                         False).first()
+    return dominant.get("landuse").getInfo()
 
-    if count == 0:
-        return "Not classified"
 
-    # Add intersection area attribute
-    def calculate_intersection(f):
-        return f.set("intersect_area", f.geometry().intersection(roi, 1).area(1))
+# --- UPDATED: Full suitability score model ---
+def calculate_suitability_score(slope_stats, road_stats, shape_metrics, veg_cover):
+    """Calculates a weighted suitability score based on multiple factors."""
 
-    area_stats = intersected.map(calculate_intersection)
+    # --- Define weights for each factor (must sum to 1.0) ---
+    WEIGHTS = {
+        "slope": 0.40,
+        "roads": 0.25,
+        "shape": 0.20,
+        "vegetation": 0.15
+    }
 
-    # Find land use with max overlap
-    dominant = area_stats.sort('intersect_area', False).first() # Sort descending
+    # --- Score each factor on a scale of 0 to 100 ---
 
-    landuse_value = dominant.get("landuse").getInfo()
+    # 1. Slope Score (lower is better)
+    mean_slope = slope_stats.get('mean') or 0
+    slope_score = max(0, 100 - (mean_slope * 5))  # Harsh penalty for steep slopes
 
-    return landuse_value
-
-def calculate_suitability_score(slope_stats, road_stats, veg_cover):
-    score = 100
-    if (slope_stats.get('mean') or 0) > 15:
-        score -= ((slope_stats.get('mean') or 0) - 15) * 2
-    if (road_stats.get('min') or 0) > 500:
-        score -= ((road_stats.get('min') or 0) - 500) / 20
-    if 30 <= veg_cover <= 80:
-        score += 5
+    # 2. Road Proximity Score (closer is better)
+    min_dist_road = road_stats.get('min') or 5000
+    if min_dist_road < 100:
+        road_score = 100
+    elif min_dist_road > 2000:
+        road_score = 0
     else:
-        score -= 5
-    return max(0, min(100, score))
+        road_score = 100 * (1 - (min_dist_road - 100) / 1900)
 
-# --- API Endpoint ---
-@app.post("/analyze", response_model=AnalysisResult)
-def analyze_parcel(request: AnalysisRequest):
+    # 3. Shape Score (uses the pre-calculated regularity score)
+    shape_score = shape_metrics.get('regularity_score') or 0
+
+    # 4. Vegetation Score (an optimal range is best)
+    if 10 <= veg_cover <= 60:
+        veg_score = 100  # Ideal range for development/agriculture
+    elif veg_cover < 10:
+        veg_score = 60  # Potentially arid
+    else:
+        veg_score = 40  # Potentially dense forest, costly to clear
+
+    # --- Calculate Final Weighted Score ---
+    final_score = (
+            (slope_score * WEIGHTS["slope"]) +
+            (road_score * WEIGHTS["roads"]) +
+            (shape_score * WEIGHTS["shape"]) +
+            (veg_score * WEIGHTS["vegetation"])
+    )
+
+    return max(0, min(100, final_score))  # Ensure score is between 0 and 100
+
+
+# --- API Endpoints ---
+@app.post("/analyze")
+async def analyze_parcel(request: dict):
     try:
-        print("\n--- [START] New Analysis Request Received ---")
-        coords = [[p.longitude, p.latitude] for p in request.points]
-        roi = ee.Geometry.Polygon(coords)
+        coords = request.get("points")
+        roi = ee.Geometry.Polygon([[p['longitude'], p['latitude']] for p in coords])
 
-        print("1. Analyzing slope...")
         slope_data = analyze_slope(roi)
-        print("2. Analyzing vegetation...")
         veg_cover = analyze_vegetation_cover(roi)
-        print("3. Analyzing road distance...")
         road_data = analyze_distance_to_roads(roi)
-        print("4. Analyzing building distance...")
         building_dist = analyze_distance_to_buildings(roi)
-        print("5. Analyzing shape metrics...")
         shape_data = analyze_shape_metrics(roi)
-
-        # --- ADDED: Calling the new land use function ---
-        print("6. Analyzing land use zone...")
         land_use = analyze_land_use(roi)
-        print(f"   ...Land use found: {land_use}")
 
-        print("7. Calculating final score...")
-        score = calculate_suitability_score(slope_data, road_data, veg_cover)
+        # --- UPDATED: Call the real suitability score function ---
+        score = calculate_suitability_score(slope_data, road_data, shape_data, veg_cover)
 
-        result = AnalysisResult(
-            slope_stats=SlopeStats(**slope_data),
-            vegetation_cover_percent=veg_cover,
-            road_distance_stats=RoadDistanceStats(**road_data),
-            building_distance_m=building_dist,
-            shape_metrics=ShapeMetrics(**shape_data),
-            suitability_score=score,
-            land_use_zone=land_use # Added the new data to the response
-        )
-        print("--- [SUCCESS] Analysis complete. ---")
-        return result
-
+        return {
+            "slope_stats": slope_data, "vegetation_cover_percent": veg_cover,
+            "road_distance_stats": road_data, "building_distance_m": building_dist,
+            "shape_metrics": shape_data, "suitability_score": score,
+            "land_use_zone": land_use
+        }
     except Exception as e:
-        print(f"--- [ERROR] An exception occurred: {e} ---")
-        raise HTTPException(status_code=500, detail=f"Server error during analysis: {e}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
+
+
+@app.post("/savereport")
+def save_report(request: SaveReportRequest, user: dict = Depends(get_current_user)):
+    try:
+        user_uid = user.get("uid")
+        report_doc = {
+            "parcelName": request.parcelName,
+            "createdAt": datetime.datetime.now(datetime.timezone.utc),
+            "analysisData": request.reportData.dict(),
+            "polygon": [p.dict() for p in request.polygonCoords]
+        }
+        db.collection('users').document(user_uid).collection('reports').add(report_doc)
+        return {"status": "success", "message": "Report saved successfully."}
+    except Exception as e:
+        print(f"--- [ERROR] Could not save report for UID {user_uid}: {e} ---")
+        raise HTTPException(status_code=500, detail=f"Failed to save report: {e}")
+
