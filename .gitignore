@@ -1,7 +1,7 @@
 # .gitignore
 
 # Google Cloud credentials
-gen-lang-client-0427725945-dc7fe2faa8ab.json
-
+kiapa.json
+.env
 # You can also use a pattern to ignore all .json key files
 *.json
