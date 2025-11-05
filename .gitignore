@@ -5,3 +5,5 @@ kiapa.json
 .env
 # You can also use a pattern to ignore all .json key files
 *.json
+.venv
+
